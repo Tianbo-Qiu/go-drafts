@@ -346,3 +346,23 @@ Chapter 1 强调：开发者写清并发逻辑，并行与底层映射交给 run
 | **Erlang / BEAM** | **轻量 process**（非 OS process），**抢占式**调度、**独立堆**、消息传递；**不是**「共享大堆上的 green thread」那一路，类比时容易误导，宜单独记「actor + 独立堆」。 |
 
 **一句话**：**green thread ≈ 常被用来指用户态调度的轻量线程**；要严谨就写 **实现名（goroutine / virtual thread / BEAM process）** 和 **N:1 / M:N / 1:1**，少争标签。
+
+---
+
+## 配套示例代码（读完 Ch1–2）
+
+同一组「假工作」（`Sleep` 1s）对比 **串行**、**用 Sleep 等 goroutine 的反例**、以及 **`sync.WaitGroup` 正确等待**（对应 Chapter 1 里「临界区 / 同步原语」那条线）。
+
+| 目录 | 说明 |
+|------|------|
+| [`cmd/01-sequential`](./cmd/01-sequential/main.go) | 串行执行，总耗时约 5s |
+| [`cmd/02-goroutines-sleep`](./cmd/02-goroutines-sleep/main.go) | 起多个 goroutine 但用固定 `Sleep` 赌结束——**不可靠**，仅作对照 |
+| [`cmd/03-goroutines-waitgroup`](./cmd/03-goroutines-waitgroup/main.go) | `WaitGroup` 等到全部 `Done`，总耗时约 1s（多核/调度允许时接近并行墙钟） |
+
+在仓库 `note-01` 目录下：
+
+```bash
+go run ./cmd/01-sequential
+go run ./cmd/02-goroutines-sleep
+go run ./cmd/03-goroutines-waitgroup
+```
