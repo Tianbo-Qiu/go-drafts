@@ -15,12 +15,6 @@ tags:
   - study-notes
 ```
 
-### 文档说明
-
-- **定位**：围绕 *Learn Concurrent Programming with Go*（Cutajar, Manning, 2023）整理的 **技术向速查与补充**，与 [The Go Memory Model](https://go.dev/ref/mem)、[Race Detector](https://go.dev/doc/articles/race_detector) 等 **官方材料对照阅读** 最合适；**不替代**语言规范与源码。
-- **结构**：每章开头有 **「本章摘要」** 表（便于跳转与回顾），正文按主题分节展开；图与短代码用于 **建立直觉**。
-- **范围**：当前正文覆盖 **Ch1–Ch4**；文末 **`cmd/`** 为可运行示例索引，需要时再打开。
-
 ---
 
 # Chapter 1：为何用 Go 做并发 — 概念、立场与扩展直觉
@@ -728,7 +722,7 @@ flowchart TB
 
 ## 6. 与前一章的衔接
 
-第三章说明 **为何需要同步** 以及 **数据竞争** 的定义；本章落到 **`Mutex` 的互斥语义**、**临界区长度与加锁频率的折中**，以及 **`RWMutex`**：**读锁允许多读者并发**，**写锁独占且与所有读互斥**（写时不能有读者）。动手时可对照文末 **`cmd/11-rwlock-readers-writer-demo`** 的打印顺序建立直觉。
+第三章说明 **为何需要同步** 以及 **数据竞争** 的定义；本章落到 **`Mutex` 的互斥语义**、**临界区长度与加锁频率的折中**，以及 **`RWMutex`**：**读锁允许多读者并发**，**写锁独占且与所有读互斥**（写时不能有读者）。动手时可对照 **`cmd/11-rwlock-readers-writer-demo`**（标准库）与 **`cmd/12-rwmutex-from-scratch`**（自拼语义）的打印顺序。
 
 ---
 
@@ -749,8 +743,9 @@ flowchart TB
 | `cmd/08-bank-mutex` | 同上，`mutex` 保护读改写 |
 | `cmd/09-rfc-freq-mutex` | 多 goroutine 拉 RFC，**锁仅包住对 `freq` 的写**（需外网） |
 | `cmd/10-events-rwmutex` | **`RWMutex`**：写事件 + 多读快照 |
-| `cmd/11-rwlock-readers-writer-demo` | **读写锁教学**：多读者 `RLock` 并发读 + 写者 `Lock` 独占；打印顺序可观察 **写等读放、读后写** |
+| `cmd/11-rwlock-readers-writer-demo` | **`sync.RWMutex`**：多读者 + 写者独占；打印顺序可看 **写等读放、读后写** |
+| `cmd/12-rwmutex-from-scratch` | **两把 `Mutex` 拼读写锁**（教学实现，非 `sync` 源码）；与标准库对照 |
 
-在 `note-01` 下：`go run ./cmd/…`；对 `07` 可试 `go run -race ./cmd/07-bank-race`；**`11`** 适合对照 Chapter 4 读锁/写锁口诀：`go run ./cmd/11-rwlock-readers-writer-demo`。
+在 `note-01` 下：`go run ./cmd/…`；对 `07` 可试 `go run -race ./cmd/07-bank-race`；**`11` / `12`** 可对照 Chapter 4：`go run ./cmd/11-rwlock-readers-writer-demo`、`go run ./cmd/12-rwmutex-from-scratch`。
 
 </details>
