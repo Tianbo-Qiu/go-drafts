@@ -15,6 +15,14 @@ tags:
   - study-notes
 ```
 
+## `note-01` 仓库结构
+
+| 路径 | 内容 |
+|------|------|
+| **`README.md`** | 全书笔记 **Ch1–Ch5**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**）；附录为 **`cmd/`** 示例索引。 |
+| **`cmd/<name>/main.go`** | 与章节对应的小程序；在 **`note-01`** 根目录执行 **`go run ./cmd/<name>`** 或 **`go build ./...`**。 |
+| **`go.mod`** | Module 路径与 Go 版本。 |
+
 ---
 
 # Chapter 1：为何用 Go 做并发 — 概念、立场与扩展直觉
@@ -726,10 +734,166 @@ flowchart TB
 
 ---
 
+# Chapter 5：`sync.Cond` 与信号量 — 在互斥之上等待「条件成立」
+
+**本章主线**：**`Mutex`** 只保证互斥；**`Cond`** 在 **持锁** 前提下 **阻塞并让出锁**，用 **`Signal` / `Broadcast`** 在 **同样持锁** 的路径上协作。**计数信号量** 用非负整数 **`permits`** 表达「还剩几个名额 / 已积压几条信用」：**`Acquire` 消费一次（不够就等），`Release` 归还或发放一次**。特别地，**初值 `permits = 0`** 时，**`Release` 与 `Acquire` 的先后顺序不必与 goroutine 启动顺序一致**——**先 `Release` 后 `Acquire`** 只是把 **信用先记入计数**，后到的 `Acquire` 照样能扣到；**先 `Acquire`** 则阻塞，直到别处 **`Release`**。这与 **无缓冲 channel**「必须收发双方同时就绪」的时序压力 **不是同一类问题**。
+
+**本章摘要**
+
+| 主题 | 说明 |
+|------|------|
+| **`sync.Cond`** | 与 **`Locker`**（多为 `Mutex`）绑定；**`Wait` / `Signal` / `Broadcast` 须在持 `c.L` 时调用**（[Cond](https://pkg.go.dev/sync#Cond)）。 |
+| **`Wait`** | 调用前 **已持锁**；内部 **释放锁并睡眠**；返回时 **再次持锁**。 |
+| **`Signal` / `Broadcast`** | 唤醒一个或全部等待者；在 **更新完共享条件** 之后、**仍持锁** 时调用，降低 **丢信号** 风险。 |
+| **用 `for` 不用 `if`** | 被唤醒 **≠** 谓词已为真；用 **`for !pred() { c.Wait() }`** 重检不变量。 |
+| **丢信号** | 无互斥或 waiter 未 `Wait` 时发信号，可能 **丢**；典型修法是 **锁 + 条件 + 在锁内 Signal**。 |
+| **写饥饿** | **读、写共抢一把 `Mutex`** 且读极频时，写者 **长期进不去**；**`RWMutex`** 用读写分离与实现策略 **缓解**。 |
+| **写偏好（`Cond`）** | 用 **计数 + `Cond`** 显式写「有写者等待则读者阻塞」；见 **`cmd/16`**。 |
+| **信号量（一般）** | **`permits = N`**：最多 **N** 个并发进入某段逻辑（**限流**）。 |
+| **`permits = 0` 与次序** | **`Release` 可先可后**：计数是 **全局账本**，先加后减与先减（阻塞）再加都合法；**不依赖**「谁先启动 goroutine」这种顺序。 |
+| **生产库** | **[`golang.org/x/sync/semaphore`](https://pkg.go.dev/golang.org/x/sync/semaphore)**；教学自拼见 **`cmd/17`**。 |
+
+---
+
+## 1. `Mutex` 不够时：`Cond` 解决什么问题
+
+互斥只解决 **「同一时刻谁进临界区」**；不表达 **「等到余额 ≥ 50 再扣款」** 这类 **条件**。若在临界区里用 **`for !cond { }` 空转**，会占着锁还烧 CPU。`Cond` 让等待方 **暂时离开锁、进入睡眠**，把 CPU 让给别人；条件可能被满足时，由修改共享状态的一方 **`Signal` / `Broadcast`**，等待方醒来后 **在同一把锁保护下重读状态**。
+
+```mermaid
+sequenceDiagram
+  participant W as waiter
+  participant M as Cond_L_mutex
+  participant S as notifier
+  W->>M: Lock
+  W->>W: for 条件不成立
+  W->>W: Wait（Unlock 并睡眠）
+  S->>M: Lock
+  S->>S: 更新共享状态
+  S->>W: Signal 或 Broadcast
+  S->>M: Unlock
+  W->>W: 唤醒后重新 Lock
+  W->>W: for 再检条件
+```
+
+---
+
+## 2. API 契约（与 `sync.Cond` 文档一致）
+
+- **`sync.NewCond(l sync.Locker)`**：`l` 几乎总是 **`&sync.Mutex{}`**；`c.L` 即该 `Locker`。
+- **`c.Wait()`**：调用前 **必须已 `c.L.Lock()`**；`Wait` 返回时 **已重新持有 `c.L`**。
+- **`c.Signal()` / `c.Broadcast()`**：**在持有 `c.L` 时调用**，且通常 **在更新完「等待方所等的那部分共享状态」之后** 调用，避免 **丢信号** 与 **数据竞争**。
+
+---
+
+## 3. 为什么用 `for`，而不是 `if`
+
+从 `Wait` 返回 **只说明「有人让你再检查一次」**，不保证 **你关心的布尔条件已经为真**。原因包括：**虚假唤醒**、多个 waiter 被 **`Broadcast`** 同时唤醒后 **只有一个该前进**、以及唤醒与再次检查之间 **又有第三个 goroutine 改了状态**。因此模式几乎是固定的：
+
+```go
+c.L.Lock()
+for !ready() { // 或 for amount < threshold 等
+    c.Wait()
+}
+// 此时在锁内，且 ready() 为真，再改状态
+c.L.Unlock()
+```
+
+---
+
+## 4. `Broadcast` 与 `Signal` 怎么选
+
+- **`Signal`**：只有一个等待者会从当前状态变化中受益（典型 **生产者–消费者** 队列非空时唤醒一个消费者）。
+- **`Broadcast`**：条件变化后 **多个等待者** 各自需要 **重新判断自己的谓词**（例如 **「所有玩家到齐」** 后，每个 goroutine 都要退出「等人」循环）。
+
+### 4.1 `Cond` 与 `channel` 何时更顺手
+
+**`channel`** 适合表达 **所有权传递、流水线、取消（`context`）** 等「**数据或控制流在 goroutine 之间流动**」的模型。**`Cond`** 适合 **已有一把锁保护的结构体**，在 **不变量暂时不成立** 时要 **阻塞并让出 CPU**，且唤醒方 **也在同一把锁下改同一批字段**。二者可同库共存：例如 **外层用 `Mutex+Cond` 维护复杂状态**，边界上仍用 **channel 与外部世界交互**。
+
+---
+
+## 5. 写饥饿、`RWMutex`、以及用 `Cond` 做写偏好
+
+**现象**：若 **读、写都争用同一把 `Mutex`**，而 **读临界区短、调用极频**，则锁常在读者之间传递，**写者长期拿不到锁**，称为 **写饥饿**（与第四章「读锁多人并发」不是同一模型：那是 **`RWMutex` 已区分读写**）。
+
+**标准库 `sync.RWMutex`**：把 **读** 与 **写** 分开；**写者在等待时**，实现会限制 **新来的读者** 与写者抢锁，从而 **缓解** 写饥饿（细节以 **当前 Go 版本实现** 为准）。
+
+**自实现写偏好**：在 **`RWMutex` 出现之前或需要额外策略** 时，可用 **`readersCounter` / `writersWaiting` / `writerActive` + `Cond` + `for` 循环** 表达「有写者等待则读者在 `ReadLock` 里阻塞」等规则；复杂度与正确性成本都高，**默认仍应优先标准库**。
+
+---
+
+## 6. 信号量：计数、`permits = N` 限流、与 `permits = 0` 的次序
+
+### 6.1 计数在表示什么
+
+把信号量想成 **非负整数 `permits`**（在互斥或 `Cond` 保护下维护）：
+
+- **`Acquire()`**：若 `permits > 0`，则 **`permits--`** 并返回；若 **`permits == 0`**，则 **阻塞**（内部等价于「等到 `permits` 变成正数再减」）。
+- **`Release()`**：**`permits++`**，并 **唤醒** 可能在等的 `Acquire`。
+
+```mermaid
+flowchart LR
+  subgraph sem["计数信号量"]
+    p["permits 非负整数"]
+    A["Acquire：>0 则减一并通过；=0 则阻塞"]
+    R["Release：加一并唤醒等待者"]
+  end
+  p --> A
+  R --> p
+```
+
+### 6.2 `permits = N`：限流（槽位）
+
+初值 **`permits = N`** 时，**最多 N 个** goroutine 能「同时通过」`Acquire` 进入某段受保护逻辑（例如限制对下游 HTTP、DB 的并发）。每完成一段工作可 **`Release`** 归还一个槽位，或 **`defer Release()`** 在退出路径上归还。
+
+### 6.3 `permits = 0`：完成记账——**先 `Release` 还是先 `Acquire` 无所谓**
+
+初值 **`permits = 0`** 时，语义是：**当前没有预存槽位，但允许通过 `Release` 先「记账」**。因此：
+
+- **工作 goroutine 先 `Release`、主 goroutine 后 `Acquire`**：每次 `Release` 把 **`permits` 加 1**；主 goroutine 的 `Acquire` 只是 **消费已存在的信用**，**完全合法**。不存在「必须先有人等在 `Acquire` 上，`Release` 才有效」这种要求。
+- **主 goroutine 先 `Acquire`、工作 goroutine 后 `Release`**：第一个 `Acquire` 看到 **`permits == 0`** 会 **阻塞**，直到某个 `Release` 把计数推到正数——这也是常见写法。
+
+**要点一句话**：**次序由「谁先需要消费 / 谁先产生信用」决定，不由语言强制**；与 **无缓冲 channel** 那种「发送与接收要同时配合才能完成一次握手」的 **同步点** 不同，信号量这里是 **异步计数账本**。
+
+**对照（完成 N 件异步事）**：
+
+| 方式 | 时序特点 |
+|------|----------|
+| **`sync.WaitGroup`** | 通常 **`Add(N)`** 在前，每个任务 **`Done()`**；`Wait` 等计数归零，**API 约束**更明确。 |
+| **无缓冲 `chan struct{}`** | 常见模式是 **接收方先等、发送方后关** 等，**容易在「谁先」上写死**。 |
+| **`Semaphore(0)` + N 次 `Release` / N 次 `Acquire`** | **`Release` 可早于对应的 `Acquire` 发生**；计数把 **「已完成」** 先存起来，**后到的 `Acquire` 照样扣账**。 |
+
+示意（逻辑片段，非完整程序）：
+
+```go
+// 次序 A：子任务先 Release，主流程后 Acquire（与 cmd/17 同思路）
+sem := NewSemaphore(0)
+go func() { work(); sem.Release() }() // 先记账：permits 变为 1
+sem.Acquire() // 后消费：permits 回到 0，不阻塞
+
+// 次序 B：主流程先 Acquire，子任务后 Release（常见「等完成」）
+sem := NewSemaphore(0)
+go func() { work(); sem.Release() }()
+sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
+```
+
+只要 **`Release` 总次数** 与 **`Acquire` 总次数** 在逻辑上匹配（例如各 **N** 次完成 **N** 个任务），**谁先谁后** 可以在单条边上任意交错，**不会出现「少一次 Release 就永远死锁」以外的顺序禁忌**（死锁仍可能来自 **Acquire 等不到足够的 Release**，那是 **计数配错** 而不是 **先后语法错误**）。
+
+### 6.4 与 `Cond` 的关系、以及生产代码
+
+用 **`sync.Cond` + `permits` + `for permits<=0 { Wait() }`** 可以 **自拼** 出上述语义，便于理解 **`x/sync/semaphore`** 内部也在解决同类问题。生产环境优先使用 **[`golang.org/x/sync/semaphore`](https://pkg.go.dev/golang.org/x/sync/semaphore)**（带 **context**、与调度集成更好）；本地教学见 **`cmd/17-semaphore-from-cond`**。
+
+---
+
+## 7. 与 Chapter 4 的衔接
+
+第四章：**互斥与读写锁的语义**。本章：**在互斥保护的不变量上阻塞与唤醒**（**`Cond`**），以及 **用计数表达并发槽位与完成信号**（**信号量**）。写偏好读写锁是 **`Cond` + 计数状态** 的典型组合题，读懂 **`cmd/16`** 有助于理解标准库 **`RWMutex`** 要解决的矛盾。
+
+---
+
 <details>
 <summary><strong>可选附录</strong>：仓库 <code>cmd/</code> 示例与命令（读笔记时可跳过）</summary>
 
-与正文 **知识性无关**，仅供本机想动手时对照。原根目录 `main.go` 已拆入下列目录。
+与正文独立；示例在 **`cmd/`** 各子目录。
 
 | 目录 | 说明 |
 |------|------|
@@ -745,7 +909,12 @@ flowchart TB
 | `cmd/10-events-rwmutex` | **`RWMutex`**：写事件 + 多读快照 |
 | `cmd/11-rwlock-readers-writer-demo` | **`sync.RWMutex`**：多读者 + 写者独占；打印顺序可看 **写等读放、读后写** |
 | `cmd/12-rwmutex-from-scratch` | **两把 `Mutex` 拼读写锁**（教学实现，非 `sync` 源码）；与标准库对照 |
+| `cmd/13-cond-bank-stingy-spendy` | **`sync.Cond`**：存款/取款在余额门槛上 **`Wait` / `Signal`** |
+| `cmd/14-cond-wait-loop` | 父 goroutine **`for` + `Wait`** 依次等子任务 |
+| `cmd/15-cond-broadcast-players` | **`Broadcast`**：人到齐后全员继续 |
+| `cmd/16-rwmutex-write-prefer-cond` | **`Cond` 实现写偏好**读写锁（教学） |
+| `cmd/17-semaphore-from-cond` | **`Cond` 拼计数信号量**；`permits=0` 与完成计数 |
 
-在 `note-01` 下：`go run ./cmd/…`；对 `07` 可试 `go run -race ./cmd/07-bank-race`；**`11` / `12`** 可对照 Chapter 4：`go run ./cmd/11-rwlock-readers-writer-demo`、`go run ./cmd/12-rwmutex-from-scratch`。
+在 `note-01` 下：`go run ./cmd/…`；对 `07` 可试 `go run -race ./cmd/07-bank-race`。Chapter 4：`11`、`12`；Chapter 5：`13`–`17`（如 `go run ./cmd/13-cond-bank-stingy-spendy`）。
 
 </details>
