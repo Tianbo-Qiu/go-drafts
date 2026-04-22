@@ -19,7 +19,7 @@ tags:
 
 | 路径 | 内容 |
 |------|------|
-| **`README.md`** | 全书笔记 **Ch1–Ch5**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**）；附录为 **`cmd/`** 示例索引。 |
+| **`README.md`** | 全书笔记 **Ch1–Ch6**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**、**WaitGroup / Semaphore / Barrier**）；附录为 **`cmd/`** 示例索引。 |
 | **`cmd/<name>/main.go`** | 与章节对应的小程序；在 **`note-01`** 根目录执行 **`go run ./cmd/<name>`** 或 **`go build ./...`**。 |
 | **`go.mod`** | Module 路径与 Go 版本。 |
 
@@ -722,7 +722,7 @@ flowchart TB
 
 | 主题 | 说明 |
 |------|------|
-| **`WaitGroup`** | **`Add` 与 `Done` 必须配对**：在启动 goroutine **之前** `Add`，每个 goroutine **`defer Done()`**；顺序错了会 **panic** 或 **`Wait` 永远等不到**。 |
+| **`WaitGroup`** | **`Add` 与 `Done` 必须配对**：`Add` 在启动 goroutine **之前**、`Done` 用 `defer`；顺序错了会 **panic** 或 **`Wait` 永远等不到**。详细语义、`happens-before`、Go 1.25 的 `wg.Go` 见 **Chapter 6 §1**。 |
 | **持锁调用回调** | 持锁时调用 **未知实现**（接口方法、插件、RPC）容易 **死锁**（对方再锁你）或 **拖长临界区**；持锁路径应 **短、可审、少嵌套**。 |
 | **`append` 与 slice 头** | `append` 可能分配 **新底层数组**；若把 `[]T` **按值**传进 goroutine 再 `append`，调用方可能 **看不到增长**。共享切片应通过 **结构体字段、`*[]T`、或 channel** 等明确所有权。 |
 
@@ -884,9 +884,10 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 
 ---
 
-## 7. 与 Chapter 4 的衔接
+## 7. 与前后章节的衔接
 
-第四章：**互斥与读写锁的语义**。本章：**在互斥保护的不变量上阻塞与唤醒**（**`Cond`**），以及 **用计数表达并发槽位与完成信号**（**信号量**）。写偏好读写锁是 **`Cond` + 计数状态** 的典型组合题，读懂 **`cmd/16`** 有助于理解标准库 **`RWMutex`** 要解决的矛盾。
+- **第 4 章**讲了 **互斥与读写锁的语义**；本章在此基础上加入 **「在互斥保护的不变量上阻塞与唤醒」**（**`Cond`**），以及 **「用计数表达并发槽位与完成信号」**（**信号量**）。写偏好读写锁是 **`Cond` + 计数状态** 的典型组合题，读懂 `cmd/16` 有助于理解标准库 `RWMutex` 要解决的矛盾。
+- **第 6 章**会把 `Cond` / 信号量这些底层原语**组装**成三种常见「等待」场景——**收尾**（`WaitGroup`）、**记账**（`Semaphore(0)`）、**汇合**（`Barrier`），并讨论为什么 Barrier 必须引入 **generation（分代）**。
 
 ---
 
@@ -914,7 +915,259 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 | `cmd/15-cond-broadcast-players` | **`Broadcast`**：人到齐后全员继续 |
 | `cmd/16-rwmutex-write-prefer-cond` | **`Cond` 实现写偏好**读写锁（教学） |
 | `cmd/17-semaphore-from-cond` | **`Cond` 拼计数信号量**；`permits=0` 与完成计数 |
+| `cmd/18-waitgroup-basic` | **`sync.WaitGroup`** 基本收尾同步（`Add`/`Done`/`Wait`） |
+| `cmd/19-waitgroup-file-search` | 递归文件搜索：goroutine 内部 **动态 `Add`**；用法 `go run ./cmd/19-waitgroup-file-search <dir> <substring>` |
+| `cmd/20-waitgroup-from-cond` | **`Mutex + Cond` 自拼** 动态 WaitGroup（归零 `Broadcast`） |
+| `cmd/21-barrier-reusable` | **可复用 Barrier**：带 **generation** 分代，避免跨轮串台 |
+| `cmd/22-barrier-matrix` | 多轮矩阵乘法：**两道 Barrier**（放行计算 / 等汇合）驱动 |
 
-在 `note-01` 下：`go run ./cmd/…`；对 `07` 可试 `go run -race ./cmd/07-bank-race`。Chapter 4：`11`、`12`；Chapter 5：`13`–`17`（如 `go run ./cmd/13-cond-bank-stingy-spendy`）。
+**运行方式**：在 `note-01` 根目录执行 `go run ./cmd/<name>`，全量构建用 `go build ./...`。
+
+- **Ch3 / 竞态检测**：`go run -race ./cmd/07-bank-race`（几乎必复现丢失更新）。
+- **Ch4 / 读写锁**：`go run ./cmd/11-rwlock-readers-writer-demo`、`go run ./cmd/12-rwmutex-from-scratch`。
+- **Ch5 / `Cond` 与信号量**：`go run ./cmd/13-cond-bank-stingy-spendy`、`go run ./cmd/16-rwmutex-write-prefer-cond`、`go run ./cmd/17-semaphore-from-cond`。
+- **Ch6 / 收尾·记账·汇合**：`go run ./cmd/18-waitgroup-basic`、`go run ./cmd/19-waitgroup-file-search . main`、`go run ./cmd/22-barrier-matrix`。
 
 </details>
+
+# Chapter 6：`WaitGroup`、`Semaphore(0)`、`Barrier` — 收尾、记账、汇合
+
+**本章主线**：三者都是在「等」，但等的**事件形状**不同：**`WaitGroup`** 等「一组任务整组收尾」；**`Semaphore(0)`** 把每次「完成」记成一笔**信用**，`Acquire` 可以先发生也可以后发生；**`Barrier`** 等「一轮里的**所有参与者**都到达卡点」，然后同批放行。三者都能用来「等 N 件异步事」，真正的区别是 **同步点位置、谁会阻塞、是否可复用**，以及**能否观察「第 k 件完成」**。
+
+**本章摘要**
+
+| 原语 | 计数含义 | 谁会阻塞 | 同步点位置 | 复用性 | happens-before |
+|------|----------|----------|------------|--------|----------------|
+| **`sync.WaitGroup`** | 还剩多少任务未完成 | 调 `Wait()` 的一方 | 任务**末尾** | **单轮**为主（归零后可再 `Add` 复用，需避开 race）| `Done` **hb** 对应 `Wait` 返回 |
+| **`Semaphore(N)` / `(0)`** | 已积累的「信用 / 空槽位」数 | 先到的 `Acquire()` | **任意位置**（业务自定）| **天然可复用**（一本长流水账）| `Release` **hb** 对应的 `Acquire` 返回 |
+| **`Barrier`**（自实现）| 本轮还差几人到齐 | **所有参与者** | 任务**中途**（phase boundary）| 需 **generation 分代** 才能循环 | 最后到达者的写 **hb** 其他人 `Wait` 返回 |
+
+```mermaid
+flowchart LR
+  subgraph wg["WaitGroup：一方等一组收尾"]
+    wg1["Done() × N"] --> wg2["Wait() 返回"]
+  end
+  subgraph sem["Semaphore(0)：计数账本"]
+    s1["Release() 记账 +1"] --> s2["Acquire() 扣账 −1"]
+  end
+  subgraph bar["Barrier：大家互相等"]
+    b1["参与者 1..size−1 阻塞"] --> b2["第 size 位到达 → Broadcast → 同轮一起放行"]
+  end
+```
+
+---
+
+## 1. `sync.WaitGroup`：最常用的「收尾同步」
+
+### 1.1 语义与 happens-before
+
+`WaitGroup` 内部只有一个非负计数器，API 三个：
+
+- **`Add(delta int)`**：计数 **+delta**（允许负数，但**不得**让计数变成负值，否则 panic）。
+- **`Done()`**：等价于 `Add(-1)`。
+- **`Wait()`**：阻塞到计数归零后返回；此后仍可再 `Add`、再 `Wait`，**前提是要等上一次 `Wait` 真的返回**（见下文坑）。
+
+**内存模型**：[Go Memory Model # waitgroup](https://go.dev/ref/mem#waitgroup) 规定，**所有 `Done` 调用** **happens before** 任意被解除阻塞的 **`Wait` 返回**——这就是「在 goroutine 里写的共享状态，`Wait` 之后读取是安全的」的语言级保证。
+
+### 1.2 正确使用模式
+
+```go
+var wg sync.WaitGroup
+for i := 0; i < n; i++ {
+    wg.Add(1) // 在启动 goroutine 之前 Add
+    go func() {
+        defer wg.Done()
+        doWork()
+    }()
+}
+wg.Wait()
+```
+
+要点：
+
+- **`Add` 在启动前**、**`Done` 在 `defer`**：避免两类竞态（见 1.3）。
+- **一次 `Add(n)` 比循环 `Add(1)` 省锁**；后者更灵活（允许中途生成任务）。
+- 计数**归零后**可以重用同一把 `WaitGroup`，但「新一轮 `Add`」必须**发生在上一次 `Wait` 返回之后**；否则 `Wait` 还在等时并发 `Add` 是 race。
+
+### 1.3 常见坑
+
+| 反例 | 症状 | 修法 |
+|------|------|------|
+| `go func(){ wg.Add(1); defer wg.Done(); … }()` | `Wait` 可能赶在 `Add` 之前看到 0，**提前返回** | 先 `Add` 再 `go` |
+| 某分支提前 `return` 忘了 `Done` | `Wait` **永久阻塞** | 统一用 `defer wg.Done()` |
+| 把 `WaitGroup` 当「中途汇合」 | 多阶段场景写起来别扭、易错 | 改用 `Barrier`（见 §3）或 channel |
+| `Add(-k)` 把计数推到负数 | **panic** | 用 `Done`；避免手写负数 |
+| `func f(wg sync.WaitGroup){}`（按值传递）| `Done` 加在副本上，外层永远等 | 传 `*sync.WaitGroup` |
+| 在 `Wait` 还在等时并发 `Add` | race，行为未定义 | 用额外同步点把「新一轮 `Add`」排在 `Wait` 返回之后 |
+
+### 1.4 Go 1.25+：`WaitGroup.Go`
+
+Go 1.25 为 `sync.WaitGroup` 新增便捷方法 `wg.Go(f func())`：内部把 **`Add(1)` + 启动 goroutine + `defer Done()`** 原子地打包在一处，从源头规避 1.3 里「`Add` 放进 goroutine」那类顺序坑：
+
+```go
+var wg sync.WaitGroup
+for i := 0; i < n; i++ {
+    wg.Go(func() { doWork() })
+}
+wg.Wait()
+```
+
+若工具链仍在 1.24 或更早，继续用三段式写法，语义等价。
+
+---
+
+## 2. `Semaphore(0)`：把「完成」当作可累积信用
+
+第 5 章已经把信号量定义成**非负整数 `permits`** 上的 `Acquire` / `Release`。本节重点把它与 `WaitGroup` 与无缓冲 channel **并排对照**，说清楚 **「为什么 `permits=0` 做完成记账时，先 `Release` 和先 `Acquire` 都合法」**。
+
+### 2.1 为什么「先 `Release`」合法：信号量是**异步账本**
+
+把 `permits` 想成一本小账本：
+
+- **`Release()`**：账本 **+1**，顺手叫醒一个可能在等的 `Acquire`。
+- **`Acquire()`**：账本 **> 0** 则 **−1** 通过；**= 0** 则挂起到账本再变正。
+
+因此 **「先 `Release` 后 `Acquire`」** 不会丢信用：`Release` 把 `permits` 从 0 推到 1，后到的 `Acquire` 看到正数直接扣减通过；**「先 `Acquire` 后 `Release`」** 则是 `Acquire` 先挂起，`Release` 再唤醒它。两种顺序都对。
+
+这与**无缓冲 channel** 的同步点语义**不同**：`ch <- v` 与 `<-ch` 必须**同时就绪**才能完成一次握手，没人收则发送方一直挂着；计数式信号量不存在这种「同时就绪」要求。
+
+```mermaid
+sequenceDiagram
+  participant W as worker
+  participant S as Semaphore(permits=0)
+  participant M as main
+  W->>S: Release()
+  Note right of S: permits 0 → 1
+  M->>S: Acquire()
+  Note right of S: permits 1 → 0，立刻通过
+  Note over W,M: 另一种合法次序：M 先 Acquire 挂起，W 再 Release 唤醒
+```
+
+### 2.2 完成 N 件异步事：三种写法对照
+
+| 原语 | 典型写法 | 优势 | 限制 |
+|------|----------|------|------|
+| `sync.WaitGroup` | `Add(N)` → 每任务 `Done()` → `Wait()` | API 直接、内存模型清晰、最易读 | 只能「等整组」，看不到「第 k 件完成」 |
+| `Semaphore(0)` | 每任务 `Release()` → 主流程循环 `Acquire()` N 次 | 把「完成」**摊成可逐个消费的事件**（进度条、`select` 合流）| 计数要自己数对，写错易死锁 |
+| 无缓冲 `chan T` | 任务 `ch <- r` → 主流程收 N 次 | 能把**结果**一起传出来 | 发送方必须「等到有人收」才能继续 |
+
+选型直觉：**只想等收尾**就 `WaitGroup`；**想把「完成」当事件流**就 `Semaphore(0)` 或 `chan`；**想顺带带结果 / 带错**就 channel（或后续的 `errgroup`）。
+
+### 2.3 `permits = N`：同一把原语的另一面——限流
+
+初值 `permits = N` 是**槽位**语义：最多 **N 个** goroutine 同时通过 `Acquire` 进入受保护段，`Release`（配 `defer`）归还槽位。典型场景：限制对下游 HTTP / DB / 文件句柄的并发度。**生产环境优先** [`golang.org/x/sync/semaphore`](https://pkg.go.dev/golang.org/x/sync/semaphore)（带 `context`、能被取消，与调度集成更好）；自拼教学版见 `cmd/17-semaphore-from-cond`。
+
+**一句话**：`permits = N` 是「最多 N 人同时干」；`permits = 0` 是「每干完一件记一笔账，谁想消费谁去 `Acquire`」——同一把原语的**槽位**与**信用**两面。
+
+---
+
+## 3. `Barrier`：中途卡点「全员到齐再一起走」
+
+### 3.1 语义与最小模型
+
+给定固定的 **参与者数 `size`**。每个参与者在某个同步点调用 `b.Wait()`：
+
+- 第 1..size−1 个到达者：**阻塞**。
+- 第 `size` 个到达者：本轮凑齐，负责 **`Broadcast`** 叫醒全体，大家**同时**从 `Wait` 返回进入下一阶段。
+
+**与 `WaitGroup` 最本质的区别**：`WaitGroup` 是「**一方**在外面等一组人完成」；`Barrier` 是「**大家互相等自己人**」。
+
+```mermaid
+sequenceDiagram
+  participant A as 参与者 A
+  participant B as 参与者 B
+  participant C as 参与者 C
+  A->>A: Wait（阻塞）
+  B->>B: Wait（阻塞）
+  C->>C: Wait（最后到达 → Broadcast）
+  Note over A,C: 同一轮三人同时从 Wait 返回，进入下一阶段
+```
+
+### 3.2 Go 标准库现状
+
+Go 标准库**没有** `sync.Barrier`；`Mutex + Cond` 自拼最直观。若只要一次性栅栏，用 `chan struct{}` 也能模拟。
+
+易混淆邻居：[`golang.org/x/sync/errgroup`](https://pkg.go.dev/golang.org/x/sync/errgroup) 侧重「**一组任务 + 错误传播 + `context` 取消**」，语义更接近 `WaitGroup`，**不是** barrier。
+
+### 3.3 为什么必须有 **generation（分代）**：可复用 Barrier 的关键陷阱
+
+朴素写法——只维护 `waitCount`：
+
+```go
+// 错：看起来对，但无法安全复用
+func (b *Barrier) Wait() {
+    b.mu.Lock()
+    b.waitCount++
+    if b.waitCount == b.size {
+        b.waitCount = 0
+        b.cond.Broadcast()
+    } else {
+        for b.waitCount != 0 { // 用这一条判断「是否已放行」
+            b.cond.Wait()
+        }
+    }
+    b.mu.Unlock()
+}
+```
+
+**失败路径**：
+
+1. 第 1 轮最后一人到达：`waitCount = 0`，`Broadcast`。
+2. 被叫醒的等待者还没得到 CPU 检查谓词；有个**跑得快**的参与者**已经进入第 2 轮**并调用 `Wait`：`waitCount++` 让它变成 `1`。
+3. 第 1 轮里尚未醒的那几个这时终于再检查，看到 `waitCount != 0`，以为「还没齐」继续 `Wait`——被**下一轮的计数**骗住，可能永远醒不来。
+
+**修法：再加一个 `generation`（轮次号）**，每个参与者记下进入时的 `myGen`，**只比 generation 是否推进**；最后到达者负责 `generation++ + Broadcast`：
+
+```go
+func (b *Barrier) Wait() {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    myGen := b.generation
+    b.waitCount++
+    if b.waitCount == b.size {
+        b.waitCount = 0
+        b.generation++
+        b.cond.Broadcast()
+        return
+    }
+    for myGen == b.generation {
+        b.cond.Wait()
+    }
+}
+```
+
+这样「跑得快的参与者进入下一轮」**不会污染**上一轮等待者的唤醒判定——`myGen` 是各自的时间戳，只关心轮次是否已经前进一格。完整实现见 `cmd/21-barrier-reusable`；多轮矩阵乘法见 `cmd/22-barrier-matrix`。
+
+### 3.4 何时值得用 Barrier
+
+- **迭代式并行算法 / BSP 批同步**：每轮各工人算自己那份，轮末**必须同步一次**才能进入下一轮（矩阵乘法、有限差分、物理仿真步进、回合制模拟）。
+- **参与者数量固定**、**阶段边界清晰**、对齐推进对正确性至关重要。
+- 反面：**只是「等所有任务结束」一次**用 `WaitGroup` 就够，不必上 Barrier。
+
+---
+
+## 4. 三原语互相能替代吗：决策表
+
+| 需求 | 首选 | 次选 / 兼容写法 |
+|------|------|-----------------|
+| 等一组 goroutine 全部结束 | `sync.WaitGroup`（Go 1.25+ 可用 `wg.Go`）| `chan` 收 N 次；N 次 `Semaphore.Acquire` |
+| 限并发到 N（限流）| [`x/sync/semaphore.Weighted`](https://pkg.go.dev/golang.org/x/sync/semaphore) | 自拼 `Semaphore(N)`；带 buffer 的 `chan struct{}` |
+| 把「完成」摊成可逐个消费的事件 | `Semaphore(0)` 或 `chan T` | `WaitGroup` 做不到单点观察 |
+| 多阶段、多参与者的卡点同步 | 自实现 **分代 `Barrier`** | N×N 次 `Release`/`Acquire` 手工拼凑；两阶段 `chan` |
+| 一组任务带错误传播、带 `context` | [`x/sync/errgroup.Group`](https://pkg.go.dev/golang.org/x/sync/errgroup) | `WaitGroup` + `atomic` / `mutex` 自收错 |
+| 扇出 → 扇入、带数据流 | `chan`（可配 `select` / `context`）| `WaitGroup` + 共享结果结构 |
+
+**一句话速记**：**`WaitGroup` 等收尾，`Semaphore` 记账，`Barrier` 等汇合，`errgroup` 等收尾带错**。
+
+---
+
+## 5. 与 Chapter 5 的衔接
+
+第 5 章把 **`Cond`** 与 **计数信号量** 的底层讲清楚：**阻塞 / 唤醒** 与 **计数账本**。本章把它们组装成三种常见的「等待」场景——**收尾**、**记账**、**汇合**，并点出：
+
+1. **`WaitGroup` 的 happens-before** 保证为何是「并发写 → 主流程安全读」的默认同步手段。
+2. **`Semaphore(0)`** 为什么**不依赖**「谁先发生」，本质是一本异步账本，与无缓冲 channel 的同步点语义**不同**。
+3. **`Barrier` 的 generation** 为什么**必须**有，否则跨轮就会串台——典型 `Cond` 谓词设计题。
+
+真实工程里这几种经常混用：一个主流程可能用 `errgroup` 收尾 + 用 `semaphore` 限流 + 在某个热点数据结构上用 `Cond` 等不变量。**选型按「等的是什么形状的事件」**来想，而不是按原语名字硬套。
