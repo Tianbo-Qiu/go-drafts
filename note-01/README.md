@@ -19,7 +19,7 @@ tags:
 
 | 路径 | 内容 |
 |------|------|
-| **`README.md`** | 全书笔记 **Ch1–Ch6**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**、**WaitGroup / Semaphore / Barrier**）；附录为 **`cmd/`** 示例索引。 |
+| **`README.md`** | 全书笔记 **Ch1–Ch7**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**、**WaitGroup / Semaphore / Barrier**、**CSP 与 channel**）；附录为 **`cmd/`** 示例索引。 |
 | **`cmd/<name>/main.go`** | 与章节对应的小程序；在 **`note-01`** 根目录执行 **`go run ./cmd/<name>`** 或 **`go build ./...`**。 |
 | **`go.mod`** | Module 路径与 Go 版本。 |
 
@@ -920,6 +920,15 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 | `cmd/20-waitgroup-from-cond` | **`Mutex + Cond` 自拼** 动态 WaitGroup（归零 `Broadcast`） |
 | `cmd/21-barrier-reusable` | **可复用 Barrier**：带 **generation** 分代，避免跨轮串台 |
 | `cmd/22-barrier-matrix` | 多轮矩阵乘法：**两道 Barrier**（放行计算 / 等汇合）驱动 |
+| `cmd/23-channel-sync-sentinel` | **同步 channel + STOP 哨兵**：默认同步语义；主 goroutine 退出抢跑的典型反面 |
+| `cmd/24-channel-send-deadlock` | 反例：**发送方等不到接收者** → 运行时 deadlock |
+| `cmd/25-channel-recv-deadlock` | 反例：**接收方等不到发送者** → 运行时 deadlock |
+| `cmd/26-channel-buffered` | **带 buffer 的 channel**：buffer=3 观察发送 / 接收错位 |
+| `cmd/27-channel-direction` | **方向限定**：只写 `chan<-` / 只读 `<-chan` 形参 |
+| `cmd/28-channel-close-ok` | `close(ch)` + **`msg, ok := <-ch`**：取代哨兵值 |
+| `cmd/29-channel-range` | **`for msg := range ch`**：close + ok 的语法糖 |
+| `cmd/30-channel-result` | **用 channel 回收 goroutine 返回值**（CSP 版 future） |
+| `cmd/31-close-as-broadcast` | `close(done)` 一次性唤醒所有监听者——`ctx.Done()` 的底层形态 |
 
 **运行方式**：在 `note-01` 根目录执行 `go run ./cmd/<name>`，全量构建用 `go build ./...`。
 
@@ -927,6 +936,7 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 - **Ch4 / 读写锁**：`go run ./cmd/11-rwlock-readers-writer-demo`、`go run ./cmd/12-rwmutex-from-scratch`。
 - **Ch5 / `Cond` 与信号量**：`go run ./cmd/13-cond-bank-stingy-spendy`、`go run ./cmd/16-rwmutex-write-prefer-cond`、`go run ./cmd/17-semaphore-from-cond`。
 - **Ch6 / 收尾·记账·汇合**：`go run ./cmd/18-waitgroup-basic`、`go run ./cmd/19-waitgroup-file-search . main`、`go run ./cmd/22-barrier-matrix`。
+- **Ch7 / channel 语义**：`go run ./cmd/26-channel-buffered`、`go run ./cmd/28-channel-close-ok`、`go run ./cmd/29-channel-range`、`go run ./cmd/30-channel-result`、`go run ./cmd/31-close-as-broadcast`；**预期 deadlock 反例**：`go run ./cmd/24-channel-send-deadlock`、`go run ./cmd/25-channel-recv-deadlock`。
 
 </details>
 
@@ -1171,3 +1181,403 @@ func (b *Barrier) Wait() {
 3. **`Barrier` 的 generation** 为什么**必须**有，否则跨轮就会串台——典型 `Cond` 谓词设计题。
 
 真实工程里这几种经常混用：一个主流程可能用 `errgroup` 收尾 + 用 `semaphore` 限流 + 在某个热点数据结构上用 `Cond` 等不变量。**选型按「等的是什么形状的事件」**来想，而不是按原语名字硬套。
+
+---
+
+# Chapter 7：CSP 与 channel — 通过通信共享数据
+
+**本章主线**：从前六章的「**共享内存 + 同步原语**」正式切到 **CSP（Communicating Sequential Processes）**：goroutine 之间通过 **channel** **收发消息** 来协作，**消息本身** 就在内存模型里建立 **happens-before**。默认 channel **同步**，一次成功的收发相当于一次 **握手**；加 buffer 变成 **有界队列**；方向限定在 **编译期** 收窄能力；`close` 取代旧式 **哨兵值 / poison pill**；`for range` 是 `close + ok` 的语法糖；goroutine 结果常以 channel 回收。
+
+**本章摘要**
+
+| 主题 | 说明 |
+|------|------|
+| CSP | **不共享变量，通过通信共享数据**；消息本身自带 happens-before |
+| 同步 channel | `make(chan T)`：**收发必须同时就绪**，任一侧缺席 → **deadlock** |
+| 缓冲 channel | `make(chan T, N)`：**buffer 未满** 才不阻塞发送；**为空** 时接收阻塞；是 **有界队列**，不是无限邮箱 |
+| 方向 | 形参 `chan<- T` 只写、`<-chan T` 只读；**编译期** 收窄能力 |
+| close | `close(ch)` 表示「**不会再有新消息**」；**只发送方关**；重复关或关 nil 会 panic |
+| 读已关 channel | 缓冲排空后立即返回 **零值 + `ok=false`**；用 `msg, ok := <-ch` 或 `for range ch` 判定 |
+| Sentinel / poison pill | 用特殊值示意终止；容易和业务值冲突，**`close` 是它的语言级等价品** |
+| 函数结果回收 | `resCh := make(chan T); go func(){ resCh <- f() }(); <-resCh`（CSP 版 future） |
+| close 作广播 | `close(done)` 一次性唤醒 **所有** 在 `<-done` 上阻塞的接收者；**`ctx.Done()` 内部就是这一套** |
+| nil channel | **零值是 nil**；在 nil channel 上 **收 / 发都永远阻塞**，`close(nil)` 直接 panic |
+| happens-before 精细 | **unbuffered**：receive **hb** send 完成之后的语句；**buffered(N)**：第 k 次 send **hb** 第 k 次 receive 完成 |
+| goroutine 泄漏 | 发送方阻塞在没人收的 channel 上、或接收方永远等不到值 → **goroutine 回收不了**，内存 / fd 累积 |
+| select 预告 | **Ch8 正题**：多路复用、`default` 非阻塞分支、`time.After` 超时、**`case`随机选** |
+| Fairness | 多路就绪 `select` **随机** 选一条；调度层不承诺 channel 等待者 FIFO，**不要假设「先等的一定先醒」** |
+
+---
+
+## 1. 从共享内存到消息传递：换一套协作范式
+
+前六章的主要工具是 **共享内存 + 同步原语**：`Mutex` 保不变量，`Cond` 在不变量上阻塞 / 唤醒，`WaitGroup` / 信号量做计数式收尾。CSP 换一个角度：**不让两个 goroutine 共享某块「谁都能改」的状态，而是让一个 goroutine「把消息交给」另一个 goroutine**。Go 的座右铭可以照抄：
+
+> Don't communicate by sharing memory; share memory by communicating.
+
+消息传递并不比共享内存「更高级」，只是**适合不同形状的问题**：
+
+- **共享内存 + 锁**：对 **少量共享可变状态** 做 **不变量保护**（计数器、小缓存、读多写少的表）。
+- **消息传递（channel）**：**数据 / 控制流在 goroutine 之间流动**（流水线、扇入扇出、任务分发、取消传播）。
+
+在分布式系统里消息传递几乎是唯一选项——进程之间没有共享内存，只能走 **HTTP / gRPC / 队列**。单机上的 goroutine 与此同构：channel 让「进程间通信（IPC）/ 线程间通信（ITC）」都能用同一套心智模型表达。
+
+```mermaid
+flowchart LR
+  subgraph shared["共享内存 + 锁：保护不变量"]
+    direction LR
+    gA["G_A 改"] --> state[("共享状态 + Mutex")]
+    gB["G_B 读/改"] --> state
+  end
+  subgraph csp["CSP：通过通信共享数据"]
+    direction LR
+    gC["G_C"] -->|send| ch[["channel"]]
+    ch -->|receive| gD["G_D"]
+  end
+```
+
+---
+
+## 2. 默认同步的 channel：一次成功收发 = 一次握手
+
+### 2.1 语义
+
+`make(chan T)` 得到的是 **无缓冲 channel**：
+
+- **发送方** `ch <- v`：阻塞，**直到** 有接收方执行 `<-ch`。
+- **接收方** `<-ch`：阻塞，**直到** 有发送方执行 `ch <- v`。
+- 一次成功收发是一次 **rendezvous（握手）**，语言规范规定 **send happens before the corresponding receive completes**（见 [Go Memory Model](https://go.dev/ref/mem#chan)）——**不需要** 再额外上锁来传递数据。
+
+因此同步 channel **同时负责** 两件事：**传值** + **定序**；这也是为什么前面章节里凡是「等某个 goroutine 把事情做完再继续」的场景，用 `chan struct{}` 就够了。
+
+### 2.2 一边缺席就 deadlock
+
+把 channel 想成两头接水管：**只有两头都接好**，水才能流。任一端缺席，另一端就会一直等。最小反例：
+
+```go
+msgs := make(chan string)
+go func() { time.Sleep(5 * time.Second) }() // 从不读
+msgs <- "hi" // 永久阻塞：没有接收者
+```
+
+当运行时检测到 **所有 goroutine 都在睡眠**、没人能推进时，会直接终止进程：
+
+```
+fatal error: all goroutines are asleep - deadlock!
+```
+
+对称的反例（接收方等不到发送方）也一样会 deadlock。`cmd/24-channel-send-deadlock` 与 `cmd/25-channel-recv-deadlock` 就分别演示这两种情形。
+
+### 2.3 哨兵值与 STOP：为什么等会被 `close` 取代
+
+同步 channel 上常见的一种退出约定是 **约定一个特殊值** 让接收方结束循环——在并发 / 分布式语境里这叫 **sentinel value** 或 **poison pill**：
+
+```go
+msgs <- "HELLO"
+msgs <- "WORLD"
+msgs <- "STOP" // 哨兵：接收方看到它就退出 for 循环
+```
+
+可跑的完整版见 `cmd/23-channel-sync-sentinel`。这种写法能用，但两个缺点很明显：**哨兵值要从业务域里挑一个不会冲突的 magic value**；另外，**主 goroutine 发完 STOP 就 return**，接收方的最后一行打印可能来不及完成（主函数返回即进程退出，Ch3 §6 已经点过）。§5 会给出 Go 的等价机制 `close(ch)`。
+
+```mermaid
+sequenceDiagram
+  participant S as sender
+  participant C as chan
+  participant R as receiver
+  S->>C: ch <- "HELLO"
+  C-->>R: <-ch == "HELLO"
+  S->>C: ch <- "WORLD"
+  C-->>R: <-ch == "WORLD"
+  S->>C: ch <- "STOP"
+  C-->>R: <-ch == "STOP" → break
+  Note over S,R: send happens before 对应的 receive 完成
+```
+
+### 2.4 为什么默认同步：是设计选择，不是性能取舍
+
+同步 channel 看起来「比带 buffer 的慢」，但默认同步有两条关键理由：
+
+1. **天然背压（back-pressure）**：发送方被接收方的消费速度 **立刻** 顶回去——生产 > 消费时，生产者自己就慢下来，内存不会偷偷积压。加 buffer 等于在两者之间塞一个 **有界队列**，`buffer=N` 时只能顶 N 条的不均衡；buffer 越大，越像「先写进去再说」，**bug 就越容易拖到很久后才爆**。
+2. **贴合 CSP 的「握手」模型**：一次成功收发就是 **一次同步点**，正好承担 Ch3 里强调的 **happens-before**。有 buffer 时这个同步点会挪位（见 §8.3），语义更绕。
+
+**什么时候上 buffer**：消费端确实可以「偶尔慢一点」、且业务能容忍有限堆积——比如 **日志采集 / 任务分发** 的削峰。**不要** 把 buffer 当成「反正先发出去」的逃生口。
+
+---
+
+## 3. 带缓冲 channel：有界队列
+
+`make(chan T, N)` 创建带 **容量 N** 的缓冲 channel：
+
+- 发送方：只要 **`len(ch) < N`** 就 **不阻塞**，消息先躺在 buffer 里；buffer 满时退化回「等接收方消费一个」。
+- 接收方：**`len(ch) > 0`** 时立即拿走一条；buffer 为空时退化回「等发送方送入一条」。
+- `len(ch)` 读当前条数，`cap(ch)` 读容量；注意 `len(ch)` **只是瞬时快照**，别作为业务判断依据（读到的数立刻可能变）。
+
+`cmd/26-channel-buffered` 里把 `buffer=3` 和一次塞 6 条 + 哨兵 `-1` 放在一起跑，可以直接看到 **发送方在 buffer 满时被压回**、**接收方拿走一条后发送方立刻继续** 的交错。
+
+**buffer 不是万能**：
+
+| 误解 | 实际 |
+|------|------|
+| 「加 buffer 就不会死锁」 | **错**。buffer 只推迟死锁——写入量 > 消费量时，满了照样阻塞；消费方退出，发送方一样卡死。 |
+| 「buffer 越大越安全」 | 变相把问题掩盖成 **内存涨**、**延迟堆积**；应当配合 **限流 / 背压**。 |
+| 「channel 可以当内存队列的直接替代」 | 语义上只是 **进程内、有界、FIFO** 的 goroutine 间队列；跨进程还得 **MQ / Kafka** 之类。 |
+
+```mermaid
+flowchart LR
+  S["sender"] -->|send| buf[("buffer (cap=N)")]
+  buf -->|receive| R["receiver"]
+  note1["len==N → 发送阻塞"] -.-> buf
+  note2["len==0 → 接收阻塞"] -.-> buf
+```
+
+---
+
+## 4. channel 的方向：在形参上收窄能力
+
+底层 channel 永远是双向的；但在 **函数签名** 里可以限定方向，编译器会把「只该读却去写」之类的错误挡在 **编译期**：
+
+| 形参类型 | 含义 | 允许操作 |
+|----------|------|----------|
+| `chan T` | 双向 | 收、发、`close` |
+| `chan<- T` | **只写** | `ch <- v`（不允许 `<-ch`） |
+| `<-chan T` | **只读** | `<-ch`（不允许 `ch <- v`、不允许 `close`） |
+
+```go
+func sender(out chan<- int)   { out <- 1 }
+func receiver(in <-chan int)  { _ = <-in }
+```
+
+调用点传入一个 `chan int` 时会 **自动窄化**；反向则不行（只读 channel 不能再当双向用）。这在写 **库函数 / 流水线 stage** 时特别有用：**stage 的输入声明成 `<-chan`、输出声明成 `chan<-`**，误把方向用反就编译不过。完整例见 `cmd/27-channel-direction`。
+
+---
+
+## 5. `close`：声明「不会再有新消息」
+
+### 5.1 规则
+
+- `close(ch)` **只在发送方** 调用；表示 **不会再发新消息**。
+- **关闭后仍可接收**：buffer 里剩的会被依次读完；排空后，再读立即返回 **零值 + `ok=false`**。
+- **向已关 channel 发送** → **panic: send on closed channel**。
+- **重复关** 或 `close(nil)` → **panic**。
+- **nil channel 上收发都永远阻塞**（常用于 `select` 里「暂时禁用某一路」）。
+
+用 `msg, ok := <-ch` 可以区分「收到了一条值 `v`」和「channel 已关且排空」：
+
+```go
+for {
+    msg, ok := <-ch
+    if !ok {
+        return
+    }
+    use(msg)
+}
+```
+
+完整例见 `cmd/28-channel-close-ok`。
+
+### 5.2 `close` 与 sentinel 的关系
+
+sentinel / poison pill 本质是「**用一条消息的内容** 表达控制信号」。`close` 则是「**channel 自己** 的状态变化」，二者在目的上等价，但 `close` 有两点优势：
+
+1. **不占用业务值域**：不必在 `int` 里挑一个「不可能」的值（`-1`？`MaxInt`？）。
+2. **对「所有当前与未来的接收者** 都一次性生效**：多个 range 接收者会在 channel 排空时一起退出，用 sentinel 则每条只能唤醒一个。
+
+**谁来关？** 约定俗成：**只有发送方** 关 channel；**接收方不要关**，否则很容易因为「另一路还在发」而命中 panic。多生产者的场景常再加一层 `WaitGroup`：所有生产者 `Done` 归零后，**单独一个 closer goroutine** 调用 `close`。
+
+### 5.3 与 `context` 的关系（提前预告）
+
+`context.Context` 的取消传播 **内部** 就是一个 `chan struct{}`：`ctx.Done()` 返回一个只读 channel，取消即 `close` 该 channel。**「close 是对所有接收者的广播」** 的性质被直接拿来做 **取消信号扩散**——这是 Go 取消模型最常见的底层形态。
+
+### 5.4 `close` 作「一对多广播」
+
+**普通发送只能唤醒一个接收者**：`ch <- v` 的值被 **某一个** `<-ch` 拿走，剩下的还在等。**但 `close(ch)` 会一次性解除所有正在 `<-ch` 上阻塞的接收者**——它们各自读到 **零值 + `ok=false`**。这正是 `ctx.Done()` 的工作机制：取消时不需要「数有几个监听者」，一条 close 就把所有人都叫醒。
+
+常见写法是用 `chan struct{}`（零大小，不占额外内存，只传信号）作为 **done channel**：
+
+```go
+done := make(chan struct{})
+
+for i := 0; i < n; i++ {
+    go func() {
+        <-done // 所有 worker 都阻塞在这一行
+        // ... 清理并退出 ...
+    }()
+}
+
+close(done) // 一次 close，全员同步唤醒
+```
+
+完整可运行例见 `cmd/31-close-as-broadcast`。
+
+**为什么别用「发 N 条取消消息」来替代**：`n` 可能随时变化（动态加 worker）、或压根不知道有多少监听者；`close` 的广播语义和「订阅者数量」无关，这是它 **不可替代** 的地方。
+
+---
+
+## 6. `for range ch`：close + ok 的语法糖
+
+```go
+for msg := range ch {
+    use(msg)
+}
+// channel 被 close 且排空后，range 自动退出
+```
+
+等价于手写 `for { msg, ok := <-ch; if !ok { break }; use(msg) }`。好处：
+
+- **少写一行**；更重要的是，**不会忘记处理 `ok=false`**——不然容易写出一个无限读零值的循环。
+- **配合 `close`** 天然表达 **「消费到数据流结束」**，非常适合流水线 stage 的输入侧。
+
+完整例见 `cmd/29-channel-range`。
+
+---
+
+## 7. 用 channel 回收 goroutine 的返回值
+
+Go 的 goroutine **没有返回值语法**（`go f()` 弃掉 `f` 的返回值）；要把 goroutine 的结果拿回来，最朴素的模式是让 goroutine **把结果写进 channel**：
+
+```go
+resCh := make(chan []int)
+go func() { resCh <- findFactors(12345) }()
+
+_ = findFactors(54321) // 主流程同时做别的
+result := <-resCh      // 需要时再收
+```
+
+见 `cmd/30-channel-result`。相比「共享变量 + 锁」，这种写法的优点：
+
+- **数据所有权** 随消息流动：子 goroutine 写进 channel 后就不再触碰结果，主流程收下即独占，避免共享。
+- **send happens before receive** 自动建立可见性，不用自己上锁。
+- **可扩展到多结果**：用 `chan Result` + N 次接收、或 buffer 恰好为 N 的 channel 配合 `close`，就能把「N 件结果」摊成可逐条消费的流，与 Ch6 §2 的 `Semaphore(0)` 是一个思路的两种表达。
+
+生产代码里，如果还要带 **错误** 或 **取消**，往上叠 [`golang.org/x/sync/errgroup`](https://pkg.go.dev/golang.org/x/sync/errgroup) 就能直接拿到「一组 goroutine + error + context」。
+
+---
+
+## 8. 进阶要点：操作速查、nil channel、精细 happens-before、goroutine 泄漏
+
+### 8.1 channel 操作速查表
+
+| 操作 | nil channel | 空、未关闭 | 有值、未关闭 | 已关闭、空 | 已关闭、有值 |
+|------|-------------|-----------|--------------|-----------|--------------|
+| `ch <- v`（发送） | **永远阻塞** | 阻塞等接收者（unbuffered）/ 入 buffer（buffered 未满）| 同左（buffered 未满）/ 阻塞（满）| **panic**：send on closed channel | **panic** |
+| `v := <-ch`（接收） | **永远阻塞** | 阻塞等发送者 | 立即取走一个值 | 立即返回 **零值 + `ok=false`** | 立即取走一个值；排空后变零值 |
+| `close(ch)` | **panic**：close of nil channel | 成功；后续接收依上表 | 成功；buffer 里已存的仍可被读完 | **panic**：close of closed channel | **panic** |
+| `len(ch)` / `cap(ch)` | 0 / 0 | 0 / cap | 0..cap / cap | 0 / cap | 0..cap / cap |
+
+两个约束值得刻进肌肉记忆：**关 channel 只由发送方做、且只关一次**；**nil channel 的 close 和双 close 一样会 panic**（不是什么「nil 安全」）。
+
+### 8.2 nil channel：永远阻塞的「空挡位」
+
+`var ch chan int` 得到 **零值 nil**，**没有 `make`**。在 nil channel 上收 / 发都 **永远阻塞**，这不是 bug，是 **刻意设计**——它在 **`select`** 里有一个经典用途：**把某一个 case「动态禁用」**。
+
+```go
+var recv <-chan T        // 初始为 nil
+// 某些条件满足后再挂上实际 channel
+if shouldListen { recv = realCh }
+select {
+case v := <-recv: // recv 是 nil 时这条 case 永远不就绪
+    handle(v)
+case <-ctx.Done():
+    return
+}
+```
+
+等 Ch8 正式讲 `select` 时会回到这里；此时只需记住：**nil channel = 永远阻塞**，不是 panic。
+
+### 8.3 Happens-before：unbuffered 和 buffered 的精细差别
+
+Ch3 的大原则是「send happens before the corresponding receive completes」，但 **unbuffered** 和 **buffered** 有一处容易踩坑的区别（见 [Go Memory Model # channel](https://go.dev/ref/mem#chan)）：
+
+| 形态 | 规则（更精确） |
+|------|----------------|
+| **Unbuffered `chan T`** | 第 k 次 **receive 完成** happens before 第 k 次 **send 完成**（因为 receive 是握手点，send 要等接收者就位才算完） |
+| **Buffered `chan T, N`** | 第 k 次 **send 完成** happens before 第 k 次 **receive 完成**（先有人把值放进 buffer，才可能被取出来） |
+| **`close(ch)`** | close 调用 happens before 读到 `ok=false` 的那次 receive |
+| **容量为 C 的 buffered** | 第 k 次 **receive 完成** happens before 第 **k + C** 次 **send 完成**（buffer 腾出一格才让第 k+C 次送入） |
+
+实用推论：**unbuffered channel 可当轻量的「同步点」**——发送方看到 `ch <- v` 返回，就能确信接收方 **至少拿到了这条消息**；**buffered channel 做不到这件事**，只保证值到了 buffer，对应接收方可能要稍后才来取。「我要确认对方处理完了」的场景默认就用 unbuffered，别在 buffer 里瞎加容量。
+
+### 8.4 Goroutine 泄漏：Go 里最常见的隐性 bug
+
+**goroutine 没有手动 kill**；它 **自己 `return` 或 panic** 才会被回收。一旦永远阻塞在一个没人配合的 channel 上，这条 goroutine + 它引用的栈 / 堆对象就一直 **占着内存**，表现为进程 RSS 缓慢上涨、go runtime profile 里 `goroutine` 数只增不减。
+
+**最经典泄漏模式**（结果 channel 没人收）：
+
+```go
+func leaky(ctx context.Context) (T, error) {
+    resCh := make(chan T) // unbuffered
+    go func() {
+        resCh <- slowCall() // 若主流程先 ctx 超时返回，这里永远阻塞
+    }()
+    select {
+    case r := <-resCh:
+        return r, nil
+    case <-ctx.Done():
+        return zero, ctx.Err() // 这里一返回，上面 goroutine 就泄漏了
+    }
+}
+```
+
+**修法三选一**：
+
+1. **buffer = 1**：`resCh := make(chan T, 1)`——子 goroutine 把值扔进 buffer 就能 return，即使主流程已经走人，也不会阻塞。**成本低、最常用**。
+2. **把 `ctx` 传给子 goroutine**，让它自己感知取消，及时 `return`。
+3. **主流程一定会接收**（不管快慢路径），把「接收」写成 `defer` 或单独 goroutine 消化掉。
+
+**排查工具**：`runtime.NumGoroutine()` 打印数量趋势；`pprof`（`/debug/pprof/goroutine?debug=2`）导出所有 goroutine 的堆栈；线上常见规律是一批 goroutine 全卡在同一个 `chanrecv` / `chansend` 地址。
+
+---
+
+## 9. 预告：`select` — 多路 channel 的复用
+
+本章所有例子都只有 **一条** channel。真实代码里常需要 **同时 waiting 多条**（比如「要么拿到结果、要么收到取消、要么超时」）。Go 为此提供 **`select` 语句**（Ch8 正题）：
+
+```go
+select {
+case v := <-resCh:           // 正常结果
+    handle(v)
+case <-ctx.Done():           // 取消 / 超时
+    return ctx.Err()
+case <-time.After(2 * time.Second): // 单独给这次操作设的超时
+    return errTimeout
+default:                     // 可选：没 case 就绪就走 default（非阻塞）
+    doSomethingElse()
+}
+```
+
+`select` 的几条关键规则（提前记住，Ch8 展开）：
+
+- **多条 case 同时就绪** → **伪随机选一条**；不要写成「A 分支优先」的依赖。
+- **没有 case 就绪** → 默认阻塞到有一条就绪；有 `default` 则立刻走 `default`（非阻塞模式）。
+- **nil channel 的 case 永远不就绪**（§8.2），这是 `select` 里常见的动态禁用手法。
+- **`time.After(d)` 返回一个 channel**，`d` 过后发一个时间值——用来给单次 `select` 加超时。
+
+没有 `select` 的 channel 编程几乎只能表达「单路等一个」；有了 `select` 才能写真正的 **扇入 / 扇出 / 超时 / 取消** 组合。
+
+---
+
+## 10. Fairness：不要假设「先等的一定先醒」
+
+- **单个 channel 上的多个等待者** 会依次醒，但 Go **并不对顺序做语言级 FIFO 承诺**；依赖顺序会在版本 / 调度 / 压力下被打脸。
+- **`select` 多路就绪时**，语言规范明确规定 **伪随机选一条** 执行（见 [Go Spec # Select statements](https://go.dev/ref/spec#Select_statements)）；这是刻意的，避免写出依赖 case 顺序的程序。
+- 因此「公平性」如果业务上需要（**老请求优先 / 轮转 / 加权**），要**自己在结构上表达**：多条 channel + 显式优先级、令牌桶、任务分片 + 固定 worker 等，不靠 runtime 的巧合。
+
+---
+
+## 11. 与前六章的衔接
+
+| 想表达的协作 | 首选原语 | 备注 |
+|--------------|----------|------|
+| 保护共享不变量（计数器 / map / 小缓存） | `sync.Mutex` / `RWMutex` | Ch4；channel 在这里通常更啰嗦 |
+| 在不变量上阻塞 / 唤醒 | `sync.Cond` | Ch5；与 mutex 绑定使用 |
+| 等一组 goroutine 收尾 | `sync.WaitGroup`（1.25+ 可 `wg.Go`） | Ch6 §1 |
+| 限并发度 N | `x/sync/semaphore.Weighted` | Ch6 §2；带 `context` 取消 |
+| 所有权 / 结果 / 控制流在 goroutine 间流动 | **channel** | **本章**；流水线、扇入扇出、取消 |
+| 取消 / 截止时间传播 | `context.Context`（底层一个 `chan struct{}`） | 本章 §5.3 |
+| 汇合卡点（phase synchronization） | 自实现 `Barrier` | Ch6 §3 |
+
+**选型口诀**：**「是不变量保护就上锁；是数据 / 控制流就用 channel。」** 大型服务几乎一定 **两者混用**——热点结构内部用 mutex 维持不变量，边界 / 流水线 / 取消用 channel。下一章起进入 **基于 channel 的并发模式**（流水线、扇入扇出、`select` 复用等），这些都是本章语义的直接组合应用。
+
+---
+
