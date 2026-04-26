@@ -19,7 +19,7 @@ tags:
 
 | 路径 | 内容 |
 |------|------|
-| **`README.md`** | 全书笔记 **Ch1–Ch8**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**、**WaitGroup / Semaphore / Barrier**、**CSP 与 channel**、**`select` 多路复用**）；附录为 **`cmd/`** 示例索引。 |
+| **`README.md`** | 全书笔记 **Ch1–Ch9**（并发模型、调度、内存与竞态、锁与读写锁、**Cond 与信号量**、**WaitGroup / Semaphore / Barrier**、**CSP 与 channel**、**`select` 多路复用**、**channel 并发模式**）；附录为 **`cmd/`** 示例索引。 |
 | **`cmd/<name>/main.go`** | 与章节对应的小程序；在 **`note-01`** 根目录执行 **`go run ./cmd/<name>`** 或 **`go build ./...`**。 |
 | **`go.mod`** | Module 路径与 Go 版本。 |
 
@@ -937,6 +937,12 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 | `cmd/37-select-nil-blocks` | **nil channel 永远阻塞**；最小死锁示例 |
 | `cmd/38-select-fan-in-disable` | **fan-in + 关闭置 nil 屏蔽 case**：销售 / 支出合并 |
 | `cmd/39-channels-fan-out-collect` | **fan-out + collect**：每个 URL 独占频率切片；与 `cmd/09` mutex 版对比 |
+| `cmd/40-quit-channel` | **quit channel 最小模板**：close 广播停止 + WaitGroup 收尾 |
+| `cmd/41-pipeline-rfc` | **3-stage pipeline**：generateUrls → downloadPages → extractWords（单线下载） |
+| `cmd/42-fan-out-fan-in` | **Fan-out + Fan-in**：20 个并发下载 + 通用 `FanIn[K]` 合并 |
+| `cmd/43-flush-on-close` | **聚合型 stage**：`longestWords` 收齐后排序输出最长 10 个 |
+| `cmd/44-broadcast` | **Broadcast / Tee**：一份输入复制给 longest / frequent 两个聚合下游 |
+| `cmd/45-take-dual-quit` | **Take + 双 quit**：上游 `quitWords` 切产线、下游 `quit` 留收尾 |
 
 **运行方式**：在 `note-01` 根目录执行 `go run ./cmd/<name>`，全量构建用 `go build ./...`。
 
@@ -946,6 +952,7 @@ sem.Acquire() // 若子任务尚未 Release，此处阻塞直到有信用
 - **Ch6 / 收尾·记账·汇合**：`go run ./cmd/18-waitgroup-basic`、`go run ./cmd/19-waitgroup-file-search . main`、`go run ./cmd/22-barrier-matrix`。
 - **Ch7 / channel 语义**：`go run ./cmd/26-channel-buffered`、`go run ./cmd/28-channel-close-ok`、`go run ./cmd/29-channel-range`、`go run ./cmd/30-channel-result`、`go run ./cmd/31-close-as-broadcast`；**预期 deadlock 反例**：`go run ./cmd/24-channel-send-deadlock`、`go run ./cmd/25-channel-recv-deadlock`。
 - **Ch8 / `select` 模式**：`go run ./cmd/32-select-multiplex`、`go run ./cmd/33-select-default-nonblock`、`go run ./cmd/34-select-stop-broadcast`、`go run ./cmd/35-select-timeout 1`、`go run ./cmd/36-select-send`、`go run ./cmd/38-select-fan-in-disable`、`go run ./cmd/39-channels-fan-out-collect`（需外网）；**预期 deadlock 反例**：`go run ./cmd/37-select-nil-blocks`。
+- **Ch9 / channel 并发模式**：`go run ./cmd/40-quit-channel`；其余需外网：`go run ./cmd/41-pipeline-rfc`、`go run ./cmd/42-fan-out-fan-in`、`go run ./cmd/43-flush-on-close`、`go run ./cmd/44-broadcast`、`go run ./cmd/45-take-dual-quit`。
 
 </details>
 
@@ -1932,4 +1939,370 @@ for _, ch := range results {
 - **Ch7** 给的是 **单路 channel 的语义**（同步 / buffered / close / range）；本章把它们 **多路组合** 起来——所有真实模式（取消、超时、扇入、扇出、合流）都是 select 的重排。
 - **Ch3 的内存模型** 在这里没有变：每条 send / receive 各自携带 happens-before；select 选哪条不影响这点。
 - **`context.Context`** 是本章 §5 / §6 的工程化封装：取消 = `close(done)`、超时 = `time.AfterFunc(d, cancel)`，使用方只需 `case <-ctx.Done():`。下一章（基于 channel 的并发模式）会把 `context` 当作默认参数挂在每个 stage 上。
+
+---
+
+# Chapter 9：基于 channel 的并发模式 — Pipeline / Fan-out·Fan-in / Broadcast / Take
+
+**本章主线**：把 Ch7 / Ch8 学到的语义拼成 **可重用的并发模式**。所有 stage 都遵循同一个签名 **`func(quit, in) <-chan T`**：内部一个 goroutine、一个 `defer close(out)`、一个 `for-select` 循环——上游 `close(out)` 让下游 `range` 在排空缓冲后正常退出；`close(quit)` 则让所有正在或之后到达的 `case <-quit:` 立即就绪，整条管道一同收尾。基于这个统一模板，本章按下列七个模式逐一拆解，每节配一张拓扑图：
+
+1. **quit channel**——所有 stage 共享的取消信号
+2. **Pipeline**——stage 串接成流水线
+3. **Fan-out**——多 worker 并发消费同一输入，由运行时 FIFO 调度等待中的 receiver 形成负载均衡
+4. **Fan-in**——多个输出汇聚到一条，配 `WaitGroup` + 独立的 closer goroutine
+5. **Flushing on close**——聚合型 stage 的「先攒齐、再一次性输出」节奏
+6. **Broadcast / Tee**——把一份输入复制给 N 个下游
+7. **Take + 双 quit**——早停时把「停产」与「收尾」两个取消信号 **拆开**，避免 sink 在还没产出最终结果前就被打断
+
+最后一节（§9）把 `quit chan` 替换成 `context.Context`，给出工程版的等价模板。
+
+**本章摘要**
+
+| 模式 | 形状 | 关键约束 |
+|------|------|----------|
+| Stage 模板 | `func(quit, in) <-chan T`，goroutine + `defer close(out)` + for-select | **谁创建谁关闭**：每条 channel 仅由创建它的 stage close |
+| quit | 所有 stage 共享一条 `<-chan struct{}` | **仅由单个所有者 close 一次**；多个 goroutine 都可能 close 时用 `sync.Once` 包装 |
+| Pipeline | 串行 stages，`A → B → C` | 上游 `close(out)` → 下游 `range` 排空缓冲后退出 |
+| Fan-out | 同一 input → N 个 worker | 每条消息只投递给其中一个 worker（不重复、不广播） |
+| Fan-in | N 个 input → 1 条 output | `WaitGroup` 等所有转发 goroutine 退出后，由独立的 closer 关 output |
+| Flush-on-close | drain → 聚合 → 输出 | 必须读到 input close 才能产出最终结果；中途 quit 时直接 return，不输出部分结果 |
+| Broadcast | 1 条 input → N 条 output | dispatch 顺序写每个下游，**最慢的下游决定整体节奏**；用 buffer 或异步消费缓解 |
+| Take + 双 quit | producer / sink 拆分 | `quitWords` 切上游、`quit` 切下游；Take 取够后只 close 上游 quit |
+
+**全章共用的「stage 模板」**：
+
+```go
+func stage[I, O any](quit <-chan struct{}, in <-chan I) <-chan O {
+    out := make(chan O)
+    go func() {
+        defer close(out) // 1) 由 stage 自己负责关闭它创建的 out
+        for {
+            select {
+            case v, ok := <-in:
+                if !ok {
+                    return  // 2) 上游 close 后 ok=false → 自己 return → defer 关 out
+                }
+                y := transform(v)
+                select {
+                case out <- y: // 3) 向下游 send 时也要听 quit，否则 quit 后会卡在这一步
+                case <-quit:
+                    return
+                }
+            case <-quit:
+                return       // 4) 中途取消：直接 return，defer 仍会关 out
+            }
+        }
+    }()
+    return out
+}
+```
+
+```mermaid
+flowchart LR
+    in[("in <-chan I")] -->|for-select| g(("goroutine\n+ defer close(out)"))
+    quit[("quit <-chan struct{}")] -.->|case &lt;-quit| g
+    g -->|case out &lt;- y| out[("out <-chan O")]
+```
+
+后面每节都是这个模板的具体应用。
+
+---
+
+## 1. Stage 签名与「不可变消息」原则
+
+| 约定 | 原因 |
+|------|------|
+| 每个 stage 只对外暴露 **`<-chan T`**（接收向） | 类型层面阻止外部 `close` 或 send |
+| `quit` 用 `<-chan struct{}` | 仅传信号、不带值；`struct{}` 零字节，纯粹做事件用 |
+| **传值，或仅传指向只读数据的指针** | 避免发送方与接收方共享可变内存而引入数据竞争（Ch3） |
+| stage 内部状态完全私有 | 没有跨 goroutine 的共享可变状态，天然无 race |
+
+> 「**消息一旦发进 channel，就视作所有权移交给了下游**」——这是 CSP 的关键约束。如果非要传指针，请把所指对象当作 **不可变** 处理（构造完成后不再写），或在 send 前完整拷贝一份。
+
+---
+
+## 2. quit channel：朴素的取消信号
+
+```mermaid
+flowchart LR
+    main["main"] -->|defer close(quit)| quit[/"quit (chan struct{})"/]
+    quit -.->|case &lt;-quit| s1["stage 1"]
+    quit -.->|case &lt;-quit| s2["stage 2"]
+    quit -.->|case &lt;-quit| s3["stage 3"]
+    quit -.->|case &lt;-quit| sink["sink / aggregator"]
+```
+
+**用法**：
+
+- 创建：`quit := make(chan struct{})`；常用 `defer close(quit)` 在主流程退出前确保广播一次取消。
+- 监听：每个 stage 在 `select` 里都加一条 `case <-quit: return`。
+- 广播：`close(quit)` 之后，所有正在阻塞或之后到达的 `<-quit` 都会立刻就绪、返回零值——一次 close 即一对多广播（参 Ch7 §5.4）。
+
+**最小可跑版**：`cmd/40-quit-channel`——主流程读完 10 条后 `close(quit)`，生产 goroutine 在下一轮 select 命中 `<-quit` 后退出。
+
+**与 `context.Context.Done()` 的关系**：`ctx.Done()` 内部就是一条 `chan struct{}`，`cancel()` 等价于 `close` 它。本章先用裸 quit 把模式讲透，§9 给出迁移到 `context` 的等价写法。
+
+---
+
+## 3. Pipeline：把 stage 串起来
+
+```mermaid
+flowchart LR
+    quit[/"quit"/] -.-> g1
+    quit -.-> g2
+    quit -.-> g3
+    g1["generateUrls"] -->|urls| g2["downloadPages"]
+    g2 -->|pages| g3["extractWords"]
+    g3 -->|words| sink["main: range words"]
+```
+
+每个 stage 都是「输入 channel + quit → 输出 channel」的小盒子，**main 只负责把它们组合起来**：
+
+```go
+words := extractWords(quit, downloadPages(quit, generateUrls(quit)))
+```
+
+**关闭沿管道传播**：`generateUrls` 发完后 `defer close(urls)` → `downloadPages` 的 `range urls` 自然结束，自己也 `defer close(pages)` → `extractWords` 同理 → 主流程 `range words` 退出。整条流水线由源头一次 close 触发逐级收尾，**无需额外的协调原语**。
+
+**背压（back-pressure）**：channel 默认 unbuffered，下游 range 慢则上游 send 就阻塞；整条管道的吞吐量自动对齐到最慢一级，数据不会在 stage 间隐式堆积。
+
+完整示例：`cmd/41-pipeline-rfc`（顺序下载 RFC 1100..1130；单线下载明显慢，正是下一节引入 fan-out 的动机）。
+
+---
+
+## 4. Fan-out：同一输入、多 worker 并发消费
+
+```mermaid
+flowchart LR
+    urls[("urls (1 条)")] --> w1["downloader 1"]
+    urls --> w2["downloader 2"]
+    urls --> w3["..."]
+    urls --> wN["downloader N"]
+    w1 -->|pages_1| pad((" "))
+    w2 -->|pages_2| pad
+    w3 -->|...| pad
+    wN -->|pages_N| pad
+    style pad fill:transparent,stroke-dasharray: 0 1
+```
+
+```go
+pages := make([]<-chan string, N)
+for i := 0; i < N; i++ {
+    pages[i] = downloadPages(quit, urls) // N 个 goroutine 共读同一条 urls
+}
+```
+
+**关键性质**：对每条消息，运行时只把它投递给等待中的 **某一个** receiver——一条 url 只会被一个 worker 拿走，**不需要外部锁**就实现了任务分发。Go runtime 对同一 channel 上等待的 goroutine 采用 FIFO 唤醒顺序，因此空闲 worker 会更早回到队首拿到下一条任务，整体上呈现负载均衡的效果。
+
+**注意**：fan-out 之后每个 worker 都有自己独立的 output channel，需要再来一步 fan-in 合并（§5）才能继续以单条流的形式串接。
+
+---
+
+## 5. Fan-in：多输出合并到一条
+
+```mermaid
+flowchart LR
+    p1[("pages_1")] --> f1["fwd 1"]
+    p2[("pages_2")] --> f2["fwd 2"]
+    pN[("pages_N")] --> fN["fwd N"]
+    f1 --> out[("merged")]
+    f2 --> out
+    fN --> out
+    wg["sync.WaitGroup\nwg.Wait() → close(out)"] -.等所有 fwd 完成.-> out
+```
+
+实现要点（见 `FanIn[K]` 泛型）：
+
+1. **每个上游对应一个转发 goroutine**：`for msg := range in { select { case out <- msg: case <-quit: return } }`
+2. **`sync.WaitGroup` 计数 N 个转发 goroutine**：每个在退出前 `wg.Done()`。
+3. **独立的 closer goroutine**：`go func(){ wg.Wait(); close(out) }()`——确保所有转发 goroutine 都已退出后才 `close(out)`，下游 `range` 不会在仍有 inflight 数据时被截断。
+
+**为什么不能让任何一个转发 goroutine 自己 `close(out)`**：当还有别的转发 goroutine 在 `out <- msg` 时，提前 close 会触发 `panic: send on closed channel`；而两个 goroutine 都尝试 close 又会触发 `panic: close of closed channel`。「多生产者 → 单 channel」必须由一个独立 closer 在所有生产者都结束后再 close，这是标准写法。
+
+**配合 §4 的 fan-out 跑完整流水线**：`cmd/42-fan-out-fan-in`——20 个下载 worker 并发抓取，FanIn 合并后交给单一的 extractWords。
+
+---
+
+## 6. Flushing on close：聚合 stage 的「先攒齐、再发」节奏
+
+流式（stream）stage 是「来一条处理一条」；**聚合型**（aggregating）stage 必须看到 **全部** 输入才能产出结果（最长 N 个、出现频率前 K 个、直方图、排序结果……）：
+
+```mermaid
+flowchart TB
+    in[("words")] -->|drain 阶段| state["内部状态\nseen / uniq / freq..."]
+    state -->|input close 触发| agg["聚合：sort / topK"]
+    agg -->|一次性输出| out[("longestWords / frequentWords")]
+    quit[/"quit"/] -.->|中途取消| ret["直接 return\n不输出聚合结果"]
+```
+
+模板：
+
+```go
+func aggregate(quit <-chan struct{}, in <-chan T) <-chan R {
+    out := make(chan R)
+    go func() {
+        defer close(out)
+        var st State
+    collect:
+        for {
+            select {
+            case v, ok := <-in:
+                if !ok { break collect } // 1) input close → 跳到聚合
+                st.update(v)
+            case <-quit:
+                return                    // 2) 中途取消：放弃输出
+            }
+        }
+        r := st.summary()
+        select {
+        case out <- r:                    // 3) 一次性输出
+        case <-quit:
+        }
+    }()
+    return out
+}
+```
+
+要点：
+
+- 用 **labeled break**（`break collect`）跳出外层 for；裸 `break` 只跳出当前的 select（Ch8 §4）。
+- 最终输出那次 send 也要包在 `select { case out <- r: case <-quit: }` 里，否则 quit 后会永久阻塞在那一步。
+- 中途被 quit 时 **不发送** 部分结果（`return` 让 `defer close(out)` 关掉 channel；下游 `<-out` 收到的是零值 + `ok=false`）。
+
+完整例：`cmd/43-flush-on-close`——`longestWords` 收齐所有词后排序，一次性输出最长的 10 个。
+
+---
+
+## 7. Broadcast / Tee：一份输入复制给 N 个下游
+
+**与 fan-out 的本质区别**：
+
+| 模式 | 一条消息的去向 |
+|------|----------------|
+| **fan-out** | 仅投递给等待中的 **某一个** worker（运行时保证唯一接收者） |
+| **broadcast / tee** | **每个** 下游都收到一份独立拷贝 |
+
+```mermaid
+flowchart LR
+    in[("input")] --> disp(("dispatch\ngoroutine"))
+    disp -->|每条都抄送| o1[("out_1")]
+    disp -->|每条都抄送| o2[("out_2")]
+    disp -->|...| oN[("out_N")]
+    quit[/"quit"/] -.-> disp
+```
+
+实现：dispatch goroutine 读到一条消息后 **顺序写到每个 output**：
+
+```go
+for _, c := range outs {
+    select {
+    case c <- msg:
+    case <-quit:
+        return
+    }
+}
+```
+
+**陷阱：最慢的下游决定整体节奏**。dispatch 是同步逐个 send，任何一个 `c <- msg` 阻塞，本轮分发就停在那里——其他下游也同步被推迟。缓解方式：
+
+- 给每个 output 加 **buffer**（`make(chan T, B)`）吸收短期波动；
+- 或下游内部再开 goroutine，把「receive」与「处理」解耦；
+- 业务上能容忍丢消息时，可在 send 处加 `default` 改成非阻塞投递。
+
+完整例：`cmd/44-broadcast`——同一份 word 流同时供给 `longestWords` 与 `frequentWords` 两个聚合下游。
+
+---
+
+## 8. Take + 双 quit channel：早停的边界处理
+
+需求：只取前 N 条数据，达到 N 后整条上游立即收手；与此同时，下游聚合 stage 还要把已经流入的 N 条消化完再输出最终结果。如果上下游 **共用同一条 quit**，Take 在取够后 close(quit) 会让下游聚合 stage 也立即命中 `<-quit` 直接 return，根本来不及聚合——`<-results` 拿到的是零值（对 string 即空串）。
+
+修法：把信号 **一分为二**
+
+```mermaid
+flowchart LR
+    quitW[/"quitWords (上游产线开关)"/] -.-> u1
+    quitW -.-> u2
+    quitW -.-> u3
+    quitW -.-> u4
+    u1["generateUrls"] --> u2["downloadPages × N"] --> u3["FanIn"] --> u4["extractWords"]
+    u4 --> take["Take(quitWords, N)\n取够后 close(quitWords)"]
+    take --> b["Broadcast(quit)"]
+    b --> s1["longestWords(quit)"]
+    b --> s2["frequentWords(quit)"]
+    quit[/"quit (下游收尾开关)"/] -.-> b
+    quit -.-> s1
+    quit -.-> s2
+    main["main\ndefer close(quit)\nafter results received"] -. 收完才 close(quit) .-> quit
+```
+
+**决策表**：
+
+| Stage 类型 | 用哪个 quit | 理由 |
+|------------|-------------|------|
+| **Producer**（generateUrls / downloadPages / extractWords / FanIn） | `quitWords` | 它们的取消语义是「停止生产」——Take 取够后负责 close |
+| **Limiter / 边界**（Take） | input 仍用 `quitWords`，并 **由 Take 自己 `close(quitWords)`** | Take 是上下游的切割点，取够后通知上游整体停产 |
+| **Sink / 聚合**（Broadcast / longestWords / frequentWords） | `quit` | 它们需要消化完已经收到的数据；由 main 在拿到聚合结果后再 close `quit` |
+
+判别提示：这个 stage **向 channel 写数据** → producer，用上游 quit；只 **从 channel 读** 并最终产出聚合结果 → sink，用下游 quit。
+
+完整例：`cmd/45-take-dual-quit`——Take 取够 10000 词后立即停掉下载；longestWords / frequentWords 用独立的下游 quit，等主流程拿到结果后才 close。
+
+---
+
+## 9. 工程化：把 quit chan 换成 `context.Context`
+
+把全章的 `quit <-chan struct{}` 替换成 `ctx context.Context`，模板的结构完全一致——只是把每处 `<-quit` 换成 `<-ctx.Done()`：
+
+```go
+// 旧模板
+func stage(quit <-chan struct{}, in <-chan I) <-chan O {
+    ...
+    select {
+    case v := <-in: ...
+    case <-quit: return
+    }
+}
+
+// 工程版
+func stage(ctx context.Context, in <-chan I) <-chan O {
+    ...
+    select {
+    case v := <-in: ...
+    case <-ctx.Done(): return
+    }
+}
+```
+
+好处：
+
+- **超时**：`ctx, cancel := context.WithTimeout(parent, 5*time.Second); defer cancel()`，整条管道在 5 秒后自动取消退出。
+- **传播**：`ctx` 还可携带请求级元数据（trace id、用户身份、deadline），随 stage 一路传到底层调用（HTTP / DB）。
+- **区分取消原因**：`ctx.Err()` 返回 `context.Canceled` 或 `context.DeadlineExceeded`，让上层能据此区分主动取消与超时。
+- **与 `errgroup` 配合**：[`golang.org/x/sync/errgroup`](https://pkg.go.dev/golang.org/x/sync/errgroup) 把「一组 goroutine + 错误短路 + 共享 ctx 取消」打包好，是大型管道 + 错误传递的默认选型。
+
+**双 quit 在 context 世界的等价表达**：派生两个 ctx——`producerCtx, producerCancel := context.WithCancel(parent)` 给上游、`sinkCtx, sinkCancel := context.WithCancel(parent)` 给下游；Take 取够后调 `producerCancel()` 切上游，main 收完结果后调 `sinkCancel()` 收尾。
+
+---
+
+## 10. 常见 bug 与排查
+
+| 症状 | 病因 | 修法 |
+|------|------|------|
+| 下游 `range` 永远不返回 | stage 漏写 `defer close(out)`，或某条 return 路径上没有触达 defer | 用统一模板：在 goroutine 入口处 **第一行** 就 `defer close(out)` |
+| `panic: close of closed channel` | 多个 goroutine 都对同一条 channel 调用了 close | 「谁创建谁关闭」；多生产者 → 单独 closer goroutine；不可避免时用 `sync.Once` 包装 |
+| `panic: send on closed channel` | 你向一条已被别人 close 的 channel send | 写 channel 的 stage 必须 **拥有并独占** close 权 |
+| 中途 quit 后 stage 卡住不退出 | 向下游 send 时没在 select 里同时听 `quit` | `select { case out <- v: case <-quit: return }`，对每一处 send 都要这样写 |
+| Take 关 quit 后 sink 立刻退出，main 拿到零值 | 上下游共用同一条 quit | 拆成双 quit（§8）；或在 context 版本里派生两层 ctx |
+| HTTP `panic: nil pointer dereference` | `resp, _ := http.Get(url)` 之后直接读 `resp.StatusCode` | 先 `if err != nil { ... }`，再使用 `resp`；并 `defer resp.Body.Close()` |
+| goroutine 数持续上涨 / 内存上涨 | quit 没被 close（或 ctx 没 cancel），上游 / 转发 goroutine 永久阻塞 | `defer close(quit)` / `defer cancel()`；用 `runtime.NumGoroutine()` 与 `net/http/pprof` 的 goroutine profile 定位泄漏 |
+| 「Broadcast 一处慢、全局慢」 | dispatch 同步逐个 send，最慢下游决定整体节奏 | 为每个 output 加 buffer，或在下游内部解耦 receive 与处理 |
+
+---
+
+## 11. 与 Ch7 / Ch8 / 后续的衔接
+
+- 本章所有模式都建立在 **Ch7（channel 语义）+ Ch8（select 多路复用）** 之上：每个 stage 内部就是一个 `for-select`，整个 channel 拓扑则是 Ch8 各类用法的组合。
+- **Ch4 / Ch5 / Ch6** 的同步原语并未退场——它们仍然适用于「单条 channel 不便表达」的细粒度协作：FanIn 用 `WaitGroup`、Take 与 Broadcast 用 `sync.Once`，聚合 stage 内部需要共享数据时仍可使用 mutex。
+- 掌握本章后，绝大多数 Go 服务里常见的 **worker pool / 流水线 / 限流 / 早停** 都可以由这套模板拼装出来。再往上一层是 `errgroup` 与社区的 pipeline 模式封装（参 [Go Blog: Pipelines and cancellation](https://go.dev/blog/pipelines)）——它们的核心，就是把本章的拓扑挂上 `context`，并补充错误传递与短路。
 
